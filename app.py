@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from groq import Groq
+from groq import Groq, APIError
 
 # ------------------------------------------------------------------------------
 # Configuration & Setup
@@ -88,44 +88,54 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
 # ------------------------------------------------------------------------------
 # Groq AI Inference Function
 # ------------------------------------------------------------------------------
-def generate_groq_signal(asset: str, price_data: dict, news_data: list, api_key: str) -> dict:
-    """Generate trade signal and reasoning using Groq API."""
-    try:
-        client = Groq(api_key=api_key)
-        
-        prompt = f"""
-You are an expert AI trading strategist. Analyze the current market context for {asset}.
+# List of models in order of preference
+MODEL_FALLBACKS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+]
 
-Market Data:
-- Current Price: {price_data.get('price')}
-- Daily Change (%): {price_data.get('change'):.2f}%
+def generate_groq_response(prompt: str, system_prompt: str = "You are a helpful assistant."):
+    """
+    Executes a chat completion request with automatic model fallbacks.
+    """
+    # Retrieve API key from Streamlit secrets
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        st.error("GROQ_API_KEY is missing from Streamlit secrets.")
+        return None
 
-High-Impact Economic News:
-{json.dumps(news_data, indent=2)}
+    client = Groq(api_key=api_key)
 
-Provide your response in strictly VALID JSON format matching this schema:
-{{
-    "signal": "BUY" | "SELL" | "NEUTRAL",
-    "confidence": number between 0 and 100,
-    "reasons": ["reason 1", "reason 2", "reason 3"]
-}}
-Return ONLY raw JSON, with no markdown formatting or extra text.
-"""
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
-        )
-        
-        raw_content = response.choices[0].message.content.strip()
-        parsed_json = json.loads(raw_content)
-        return parsed_json
-    except Exception as e:
-        return {
-            "signal": "ERROR",
-            "confidence": 0,
-            "reasons": [f"AI Processing Error: {str(e)}"]
-        }
+    for model in MODEL_FALLBACKS:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            # Return the successful response content
+            return response.choices[0].message.content
+
+        except APIError as e:
+            # Catch 404/model_not_found errors and log a warning to Streamlit
+            if e.status_code == 404 or "model_not_found" in str(e).lower():
+                st.warning(f"Model '{model}' unavailable (404). Trying next fallback...")
+                continue
+            else:
+                # Re-raise or handle other API errors (e.g., rate limits, bad keys)
+                st.error(f"Groq API Error: {e.message}")
+                return None
+        except Exception as e:
+            st.error(f"Unexpected error: {str(e)}")
+            return None
+
+    st.error("All model fallbacks failed. Please check Groq console for active model endpoints.")
+    return None
+
 
 # ------------------------------------------------------------------------------
 # Streamlit User Interface
