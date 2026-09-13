@@ -1,4 +1,3 @@
-import datetime
 import json
 import os
 import requests
@@ -8,18 +7,20 @@ import streamlit as st
 import yfinance as yf
 from groq import Groq, APIError
 
-# Configuration & Setup
-st.set_page_config(page_title="AI Trading Assistant", layout="wide")
+# ------------------------------------------------------------------------------
+# Configuration & Session State
+# ------------------------------------------------------------------------------
+st.set_page_config(page_title="AI Trading Assistant & Position Tracker", layout="wide")
+
+STATE_FILE = "trade_state.json"
 
 ASSET_MAP = {
-    "GBP/USD": "GBPUSD=X",
     "Gold (XAU/USD)": "GC=F",
+    "GBP/USD": "GBPUSD=X",
+    "EUR/USD": "EURUSD=X",
     "Bitcoin (BTC/USD)": "BTC-USD"
 }
 
-# ------------------------------------------------------------------------------
-# Persistent State Initialization
-# ------------------------------------------------------------------------------
 if "groq_key" not in st.session_state:
     st.session_state["groq_key"] = st.secrets.get("GROQ_API_KEY", "")
 if "telegram_token" not in st.session_state:
@@ -28,15 +29,44 @@ if "telegram_chat_id" not in st.session_state:
     st.session_state["telegram_chat_id"] = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
 # ------------------------------------------------------------------------------
-# Data Fetching Functions
+# Persistence Layer (Remembers Signals)
+# ------------------------------------------------------------------------------
+def save_active_signal(signal_data: dict):
+    """Saves the latest generated signal to Streamlit state and trade_state.json."""
+    st.session_state["active_signal"] = signal_data
+    with open(STATE_FILE, "w") as f:
+        json.dump(signal_data, f, indent=4)
+
+def load_active_signal() -> dict:
+    """Retrieves active signal from session state or trade_state.json file."""
+    if "active_signal" in st.session_state:
+        return st.session_state["active_signal"]
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                st.session_state["active_signal"] = data
+                return data
+        except Exception:
+            return None
+    return None
+
+def clear_active_signal():
+    """Removes stored signal state when a trade is closed."""
+    st.session_state.pop("active_signal", None)
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+
+# ------------------------------------------------------------------------------
+# Data Fetching & Telegram Notifications
 # ------------------------------------------------------------------------------
 def fetch_live_price(ticker_symbol: str) -> dict:
-    """Fetch live price and daily change using yfinance."""
+    """Fetch latest price and daily change from yfinance."""
     try:
         ticker = yf.Ticker(ticker_symbol)
         data = ticker.history(period="1d", interval="1m")
         if data.empty:
-            return {"price": "None", "change": "None", "status": "No Data"}
+            return {"price": 0.0, "change": 0.0, "status": "No Data"}
         
         latest_price = float(data["Close"].iloc[-1])
         open_price = float(data["Open"].iloc[0])
@@ -48,15 +78,12 @@ def fetch_live_price(ticker_symbol: str) -> dict:
             "status": "Success"
         }
     except Exception as e:
-        return {"price": "None", "change": "None", "status": str(e)}
-
+        return {"price": 0.0, "change": 0.0, "status": str(e)}
 
 def scrape_forex_factory_news() -> list:
-    """Scrape high-impact economic news events from Forex Factory."""
+    """Scrapes high-impact economic calendar events."""
     url = "https://www.forexfactory.com/calendar"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     events = []
     try:
         response = requests.get(url, headers=headers, timeout=5)
@@ -68,24 +95,19 @@ def scrape_forex_factory_news() -> list:
                 if impact and impact.find("span", class_="icon--ff-impact-red"):
                     currency = row.find("td", class_="calendar__currency")
                     title = row.find("td", class_="calendar__event")
-                    time = row.find("td", class_="calendar__time")
-                    
-                    currency_text = currency.text.strip() if currency else ""
-                    event_title = title.text.strip() if title else ""
-                    time_val = time.text.strip() if time else ""
+                    time_elem = row.find("td", class_="calendar__time")
                     
                     events.append({
-                        "time": time_val,
-                        "currency": currency_text,
-                        "title": event_title
+                        "time": time_elem.text.strip() if time_elem else "",
+                        "currency": currency.text.strip() if currency else "",
+                        "title": title.text.strip() if title else ""
                     })
     except Exception:
         pass
     return events
 
-
-def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
-    """Send an automated alert message via Telegram Bot API."""
+def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
+    """Sends Markdown formatted alert to your phone via Telegram."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
@@ -94,9 +116,8 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
     except Exception:
         return False
 
-
 # ------------------------------------------------------------------------------
-# Groq AI Inference Function
+# Groq Signal Generator
 # ------------------------------------------------------------------------------
 MODEL_FALLBACKS = [
     "openai/gpt-oss-120b",
@@ -104,29 +125,24 @@ MODEL_FALLBACKS = [
     "openai/gpt-oss-20b"
 ]
 
-
 def generate_groq_signal(asset: str, price_data: dict, news_data: list, timeframe: str, api_key: str) -> dict:
-    """Generate precise order parameters and signal reasoning using Groq API."""
     if not api_key:
         return {"signal": "ERROR", "confidence": 0, "reasons": ["Groq API key missing"]}
 
     client = Groq(api_key=api_key)
-
     news_str = json.dumps(news_data, indent=2)
     current_price = str(price_data.get("price"))
     daily_change = str(price_data.get("change"))
 
-    prompt_template = """
-You are an expert institutional trading analyst. Analyze the market structure and news for __ASSET__:
-- Timeframe: __TIMEFRAME__
-- Current Market Price: __PRICE__
-- Daily Change (%): __CHANGE__
-- Today's High-Impact News: __NEWS__
+    prompt = f"""
+You are an institutional trading analyst. Analyze parameters for {asset}:
+- Timeframe: {timeframe}
+- Current Price: {current_price}
+- Daily Change (%): {daily_change}
+- High-Impact News Today: {news_str}
 
-Evaluate technical key levels (support/resistance, liquidity sweeps) and macroeconomic risk to calculate trade setup parameters.
-
-Return ONLY a valid, raw JSON object matching this EXACT schema without markdown commentary:
-{
+Return ONLY a raw JSON object matching this schema without markdown fences or text:
+{{
     "signal": "BUY",
     "order_type": "BUY LIMIT",
     "entry_price": 0.0,
@@ -135,20 +151,9 @@ Return ONLY a valid, raw JSON object matching this EXACT schema without markdown
     "take_profit_2": 0.0,
     "risk_reward_ratio": "1:2.5",
     "confidence": 85,
-    "reasons": [
-        "Reason 1: Technical confluence or key level sweep",
-        "Reason 2: Fundamental/news catalyst analysis"
-    ]
-}
+    "reasons": ["Key structure level sweep", "News sentiment aligned"]
+}}
 """
-
-    prompt = (
-        prompt_template.replace("__ASSET__", asset)
-        .replace("__TIMEFRAME__", timeframe)
-        .replace("__PRICE__", current_price)
-        .replace("__CHANGE__", daily_change)
-        .replace("__NEWS__", news_str)
-    )
 
     for model in MODEL_FALLBACKS:
         try:
@@ -168,142 +173,216 @@ Return ONLY a valid, raw JSON object matching this EXACT schema without markdown
                 
             return json.loads(raw_content.strip())
         except APIError as e:
-            err_msg = str(e).lower()
-            if e.status_code in [400, 404] or "model" in err_msg or "decommissioned" in err_msg:
-                st.warning(f"Model `{model}` unavailable. Trying fallback...")
+            if e.status_code in [400, 404] or "decommissioned" in str(e).lower():
                 continue
-            else:
-                st.error(f"Groq API Error on {model}: {e.message}")
-                return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
-        except Exception as e:
-            st.warning(f"Unexpected error on model `{model}`: {str(e)}. Trying fallback...")
+            return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
+        except Exception:
             continue
 
-    st.error("All model fallbacks failed. Verify your Groq API key.")
-    return {"signal": "ERROR", "confidence": 0, "reasons": ["All model fallbacks failed"]}
-
+    return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
-# Streamlit User Interface
+# Check Status Logic
 # ------------------------------------------------------------------------------
-st.title("📈 AI Trading Setup & Signal Dashboard")
+def evaluate_trade_status(saved_signal: dict, current_price: float) -> tuple:
+    """Compares saved signal with live market price and produces trade advice."""
+    action = saved_signal.get("signal", "BUY").upper()
+    entry = float(saved_signal.get("entry_price", 0.0))
+    sl = float(saved_signal.get("stop_loss", 0.0))
+    tp1 = float(saved_signal.get("take_profit_1", 0.0))
 
-# Sidebar - Settings & Credentials with persistent Session Keys
-st.sidebar.header("🔑 Credentials & Setup")
+    if entry == 0.0 or sl == 0.0:
+        return "UNKNOWN", "Invalid entry or stop loss level in recorded trade."
 
-groq_key = st.sidebar.text_input(
-    "Groq API Key",
-    value=st.session_state["groq_key"],
-    type="password",
-    key="groq_key_input"
-)
+    # Pip/Point determination
+    is_gold = "GC=F" in saved_signal.get("ticker", "") or "Gold" in saved_signal.get("asset", "")
+    point = 0.1 if is_gold else 0.0001
+
+    if "BUY" in action:
+        pnl_pips = (current_price - entry) / point
+        risk_pips = (entry - sl) / point
+    else:
+        pnl_pips = (entry - current_price) / point
+        risk_pips = (sl - entry) / point
+
+    rr_achieved = pnl_pips / risk_pips if risk_pips > 0 else 0
+
+    if rr_achieved >= 1.0:
+        recommendation = "TRAIL SL TO BREAKEVEN"
+        analysis = f"🎯 1:1 Risk-to-Reward reached (+{pnl_pips:.1f} pips). Move Stop Loss to Entry ({entry}) to lock in a risk-free trade."
+    elif pnl_pips < -(risk_pips * 0.75):
+        recommendation = "EARLY EXIT / CLOSE"
+        analysis = f"⚠️ Trade is in severe drawdown (-{abs(pnl_pips):.1f} pips), approaching SL ({sl}). Market structure has invalidated."
+    else:
+        recommendation = "HOLD POSITION"
+        analysis = f"⏳ Setup structure is healthy. Current PnL: {pnl_pips:+.1f} pips. Target TP: {tp1}."
+
+    report = {
+        "action": action,
+        "asset": saved_signal.get("asset", "Asset"),
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "current_price": current_price,
+        "pnl_pips": round(pnl_pips, 1),
+        "rr_achieved": round(rr_achieved, 2),
+        "recommendation": recommendation,
+        "analysis": analysis
+    }
+
+    return recommendation, report
+
+# ------------------------------------------------------------------------------
+# Dashboard UI Layout
+# ------------------------------------------------------------------------------
+st.title("📊 AI Trading Assistant & Position Tracker")
+
+# Sidebar
+st.sidebar.header("🔑 Credentials")
+groq_key = st.sidebar.text_input("Groq API Key", value=st.session_state["groq_key"], type="password")
 st.session_state["groq_key"] = groq_key
 
-telegram_token = st.sidebar.text_input(
-    "Telegram Bot Token",
-    value=st.session_state["telegram_token"],
-    type="password",
-    key="telegram_token_input"
-)
+telegram_token = st.sidebar.text_input("Telegram Bot Token", value=st.session_state["telegram_token"], type="password")
 st.session_state["telegram_token"] = telegram_token
 
-telegram_chat_id = st.sidebar.text_input(
-    "Telegram Chat ID",
-    value=st.session_state["telegram_chat_id"],
-    key="telegram_chat_id_input"
-)
+telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=st.session_state["telegram_chat_id"])
 st.session_state["telegram_chat_id"] = telegram_chat_id
 
 st.sidebar.markdown("---")
-st.sidebar.header("📌 Asset Selection")
+st.sidebar.header("⚙️ Configuration")
 selected_asset_label = st.sidebar.selectbox("Select Asset", list(ASSET_MAP.keys()))
 selected_ticker = ASSET_MAP[selected_asset_label]
-selected_timeframe = st.sidebar.selectbox("Select Timeframe", ["15m", "1h", "4h", "1D"])
+selected_timeframe = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1D"])
 
-# Fetch News Side Panel
-st.sidebar.markdown("---")
-st.sidebar.header("📅 High-Impact News Today")
 news_list = scrape_forex_factory_news()
-if news_list:
-    for item in news_list:
-        st.sidebar.caption(f"⏱️ **{item['time']}** [{item['currency']}] - {item['title']}")
-else:
-    st.sidebar.caption("No high-impact news scraped or available.")
 
-# Main Dashboard Layout
-col1, col2 = st.columns([1, 1])
+# Main App Tabs
+tab1, tab2 = st.tabs(["⚡ Generate Signal", "🔍 Check Status"])
 
-with col1:
-    st.subheader(f"Live Market Data: {selected_asset_label}")
-    price_data = fetch_live_price(selected_ticker)
-    
-    if price_data["status"] == "Success":
-        st.metric(
-            label="Current Price",
-            value=f"{price_data['price']:.4f}",
-            delta=f"{price_data['change']:.2f}%"
-        )
-    else:
-        st.error(f"Error fetching price data: {price_data['status']}")
+# ------------------------------------------------------------------------------
+# TAB 1: SIGNAL GENERATION
+# ------------------------------------------------------------------------------
+with tab1:
+    col1, col2 = st.columns([1, 1])
 
-with col2:
-    st.subheader("Signal & Parameter Generator")
-    if st.button("Generate Trade Parameters & Send Alert"):
-        if not groq_key:
-            st.error("Please enter your Groq API Key in the sidebar or app secrets.")
+    with col1:
+        st.subheader(f"Market Data: {selected_asset_label}")
+        price_data = fetch_live_price(selected_ticker)
+        if price_data["status"] == "Success":
+            st.metric("Live Price", f"{price_data['price']:.4f}", f"{price_data['change']:.2f}%")
         else:
-            with st.spinner("Calculating entry levels, stop loss, and targets..."):
-                setup = generate_groq_signal(
-                    selected_asset_label, price_data, news_list, selected_timeframe, groq_key
-                )
-                
-                sig = setup.get("signal", "NEUTRAL")
-                conf = setup.get("confidence", 0)
-                order_type = setup.get("order_type", "MARKET")
-                entry = setup.get("entry_price", 0.0)
-                sl = setup.get("stop_loss", 0.0)
-                tp1 = setup.get("take_profit_1", 0.0)
-                tp2 = setup.get("take_profit_2", 0.0)
-                rr = setup.get("risk_reward_ratio", "N/A")
+            st.error(f"Price Error: {price_data['status']}")
 
-                if sig == "BUY":
-                    st.success(f"### {order_type} ({sig}) — {conf}% Confidence")
-                elif sig == "SELL":
-                    st.error(f"### {order_type} ({sig}) — {conf}% Confidence")
-                else:
-                    st.warning(f"### Signal: {sig} — {conf}% Confidence")
-
-                # Metrics Grid for Parameters
-                if sig in ["BUY", "SELL"]:
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Entry Price", f"{entry}")
-                    m2.metric("Stop Loss (SL)", f"{sl}")
-                    m3.metric("Take Profit 1", f"{tp1}")
-                    m4.metric("Take Profit 2", f"{tp2}")
-                    st.caption(f"**Risk:Reward Ratio:** `{rr}`")
-
-                st.markdown("**Trade Strategy Rationale:**")
-                for reason in setup.get("reasons", []):
-                    st.write(f"- {reason}")
-
-                # Dispatch formatted message to Telegram
-                if telegram_token and telegram_chat_id:
-                    msg = (
-                        f"🚨 *NEW TRADING SETUP*\n\n"
-                        f"📌 *Asset:* {selected_asset_label} ({selected_timeframe})\n"
-                        f"⚡ *Type:* `{order_type}`\n"
-                        f"📊 *Confidence:* {conf}%\n\n"
-                        f"🎯 *Entry:* `{entry}`\n"
-                        f"🛑 *Stop Loss:* `{sl}`\n"
-                        f"🟢 *Take Profit 1:* `{tp1}`\n"
-                        f"🚀 *Take Profit 2:* `{tp2}`\n"
-                        f"⚖️ *R:R Ratio:* {rr}\n\n"
-                        f"💡 *Rationale:*\n" + "\n".join([f"• {r}" for r in setup.get("reasons", [])])
+    with col2:
+        st.subheader("Generate & Dispatch Signal")
+        if st.button("Generate Signal & Push Alert", type="primary"):
+            if not groq_key:
+                st.error("Missing Groq API Key!")
+            else:
+                with st.spinner("Analyzing market structure..."):
+                    setup = generate_groq_signal(
+                        selected_asset_label, price_data, news_list, selected_timeframe, groq_key
                     )
-                    sent = send_telegram_message(telegram_token, telegram_chat_id, msg)
-                    if sent:
-                        st.success("Trade setup sent to Telegram!")
+                    
+                    sig = setup.get("signal", "NEUTRAL")
+                    if sig in ["BUY", "SELL"]:
+                        setup["asset"] = selected_asset_label
+                        setup["ticker"] = selected_ticker
+                        setup["timeframe"] = selected_timeframe
+                        
+                        # Save signal to memory and disk
+                        save_active_signal(setup)
+
+                        st.success(f"### {setup.get('order_type')} ({sig}) — {setup.get('confidence')}% Confidence")
+                        
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Entry", setup.get("entry_price"))
+                        m2.metric("Stop Loss", setup.get("stop_loss"))
+                        m3.metric("Take Profit 1", setup.get("take_profit_1"))
+                        m4.metric("Take Profit 2", setup.get("take_profit_2"))
+
+                        st.markdown("**Rationale:**")
+                        for r in setup.get("reasons", []):
+                            st.write(f"- {r}")
+
+                        # Push alert to Telegram
+                        if telegram_token and telegram_chat_id:
+                            msg = (
+                                f"📲 *NEW AI SIGNAL DISPATCH*\n\n"
+                                f"📌 *Asset:* {selected_asset_label} ({selected_timeframe})\n"
+                                f"⚡ *Action:* `{setup.get('order_type')}`\n"
+                                f"📊 *Confidence:* {setup.get('confidence')}%\n\n"
+                                f"🎯 *Entry:* `{setup.get('entry_price')}`\n"
+                                f"🛑 *Stop Loss:* `{setup.get('stop_loss')}`\n"
+                                f"🟢 *TP 1:* `{setup.get('take_profit_1')}`\n"
+                                f"🚀 *TP 2:* `{setup.get('take_profit_2')}`\n"
+                                f"⚖️ *R:R:* {setup.get('risk_reward_ratio')}\n\n"
+                                f"💡 *Rationale:*\n" + "\n".join([f"• {reason}" for reason in setup.get("reasons", [])])
+                            )
+                            if send_telegram_alert(telegram_token, telegram_chat_id, msg):
+                                st.success("Signal alert pushed to Telegram!")
+                            else:
+                                st.error("Failed to deliver Telegram notification.")
                     else:
-                        st.error("Failed to deliver Telegram alert. Verify Bot Token & Chat ID.")
+                        st.warning(f"No clear setup found: {setup.get('reasons')}")
+
+# ------------------------------------------------------------------------------
+# TAB 2: CHECK TRADE STATUS
+# ------------------------------------------------------------------------------
+with tab2:
+    st.subheader("🔍 Active Position Status Check")
+    saved_trade = load_active_signal()
+
+    if not saved_trade:
+        st.info("No recorded signal currently active. Generate a signal in Tab 1 first.")
+    else:
+        st.markdown(
+            f"**Active Signal Memory:** `{saved_trade.get('signal')}` on `{saved_trade.get('asset')}` "
+            f"| Entry: `{saved_trade.get('entry_price')}` | SL: `{saved_trade.get('stop_loss')}` | TP1: `{saved_trade.get('take_profit_1')}`"
+        )
+
+        if st.button("Check Trade Status Now", type="primary"):
+            ticker_to_check = saved_trade.get("ticker", selected_ticker)
+            live_data = fetch_live_price(ticker_to_check)
+
+            if live_data["status"] != "Success":
+                st.error("Could not pull live price to evaluate status.")
+            else:
+                curr_price = live_data["price"]
+                rec, report = evaluate_trade_status(saved_trade, curr_price)
+
+                # Visual recommendation banner
+                if "TRAIL" in rec:
+                    st.success(f"### AI Recommendation: {rec}")
+                elif "EXIT" in rec or "CLOSE" in rec:
+                    st.error(f"### AI Recommendation: {rec}")
                 else:
-                    st.info("Telegram credentials not provided. Displaying parameters on dashboard only.")
+                    st.info(f"### AI Recommendation: {rec}")
+
+                # Metric cards
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Live Market Price", f"{report['current_price']:.4f}")
+                c2.metric("Floating PnL (Pips)", f"{report['pnl_pips']:+} pips")
+                c3.metric("R:R Ratio Reached", f"1:{report['rr_achieved']}")
+
+                st.write(f"**Detailed Analysis:** {report['analysis']}")
+
+                # Dispatch recommendation update to Telegram
+                if telegram_token and telegram_chat_id:
+                    tg_update = (
+                        f"📊 *POSITION STATUS UPDATE*\n\n"
+                        f"📌 *Asset:* {report['asset']}\n"
+                        f"⚡ *Signal:* {report['action']} @ {report['entry']}\n"
+                        f"📈 *Current Price:* {report['current_price']:.4f}\n"
+                        f"💰 *PnL:* {report['pnl_pips']:+} pips\n\n"
+                        f"💡 *AI Action:* *{report['recommendation']}*\n"
+                        f"📝 {report['analysis']}"
+                    )
+                    send_telegram_alert(telegram_token, telegram_chat_id, tg_update)
+                    st.caption("Status update pushed to your Telegram.")
+
+        st.markdown("---")
+        if st.button("Clear / Close Saved Trade Record"):
+            clear_active_signal()
+            st.success("Trade state cleared from memory.")
+            st.rerun()
