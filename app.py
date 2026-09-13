@@ -95,46 +95,49 @@ MODEL_FALLBACKS = [
     "mixtral-8x7b-32768",
 ]
 
-def generate_groq_response(prompt: str, system_prompt: str = "You are a helpful assistant."):
-    """
-    Executes a chat completion request with automatic model fallbacks.
-    """
-    # Retrieve API key from Streamlit secrets
-    api_key = st.secrets.get("GROQ_API_KEY")
+def generate_groq_signal(asset, price_data, news_data, api_key):
     if not api_key:
-        st.error("GROQ_API_KEY is missing from Streamlit secrets.")
-        return None
+        return {"signal": "ERROR", "confidence": 0, "reasons": ["Groq API key missing"]}
 
     client = Groq(api_key=api_key)
+
+    prompt = f"""
+    You are an expert AI trading strategist. Analyze the following data for {asset}:
+    - Current Price: {price_data.get('price')}
+    - Daily Change (%): {price_data.get('change'):.2f}%
+    - News: {json.dumps(news_data, indent=2)}
+
+    Provide your response in strictly VALID JSON format matching this schema:
+    {{
+        "signal": "BUY" | "SELL" | "NEUTRAL",
+        "confidence": number between 0 and 100,
+        "reasons": ["reason 1", "reason 2"]
+    }}
+    Return ONLY raw JSON, with no markdown formatting.
+    """
 
     for model in MODEL_FALLBACKS:
         try:
             response = client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            # Return the successful response content
-            return response.choices[0].message.content
-
+            raw_content = response.choices[0].message.content
+            return json.loads(raw_content)
         except APIError as e:
-            # Catch 404/model_not_found errors and log a warning to Streamlit
-            if e.status_code == 404 or "model_not_found" in str(e).lower():
-                st.warning(f"Model '{model}' unavailable (404). Trying next fallback...")
+            if e.status_code == 404 or "model_not_found" in str(e):
+                st.warning(f"Model {model} unavailable, trying fallback...")
                 continue
             else:
-                # Re-raise or handle other API errors (e.g., rate limits, bad keys)
                 st.error(f"Groq API Error: {e.message}")
-                return None
+                return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
         except Exception as e:
-            st.error(f"Unexpected error: {str(e)}")
-            return None
+            return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
 
-    st.error("All model fallbacks failed. Please check Groq console for active model endpoints.")
-    return None
+    st.error("All model fallbacks failed.")
+    return {"signal": "ERROR", "confidence": 0, "reasons": ["All models failed"]}
+
 
 
 # ------------------------------------------------------------------------------
