@@ -91,12 +91,13 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
 MODEL_FALLBACKS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
+    "llama3-70b-8192",
+    "llama3-8b-8192"
 ]
 
 
 def generate_groq_signal(asset: str, price_data: dict, news_data: list, api_key: str) -> dict:
-    """Generate trade signal and reasoning using Groq API with model fallbacks."""
+    """Generate trade signal and reasoning using Groq API with active model fallbacks."""
     if not api_key:
         return {"signal": "ERROR", "confidence": 0, "reasons": ["Groq API key missing"]}
 
@@ -125,19 +126,25 @@ def generate_groq_signal(asset: str, price_data: dict, news_data: list, api_key:
                 temperature=0.2,
             )
             raw_content = response.choices[0].message.content
-            return json.loads(raw_content)
+            
+            if raw_content.startswith("```json"):
+                raw_content = raw_content[7:]
+            if raw_content.endswith("```"):
+                raw_content = raw_content[:-3]
+                
+            return json.loads(raw_content.strip())
         except APIError as e:
-            if e.status_code == 404 or "model_not_found" in str(e):
-                st.warning(f"Model {model} unavailable, attempting fallback...")
+            if e.status_code in [404, 400] or "model_not_found" in str(e) or "model_decommissioned" in str(e):
+                st.warning(f"Model {model} unavailable/decommissioned. Trying fallback...")
                 continue
             else:
-                st.error(f"Groq API Error: {e.message}")
+                st.error(f"Groq API Error on {model}: {e.message}")
                 return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
         except Exception as e:
             return {"signal": "ERROR", "confidence": 0, "reasons": [str(e)]}
 
     st.error("All model fallbacks failed.")
-    return {"signal": "ERROR", "confidence": 0, "reasons": ["All models failed"]}
+    return {"signal": "ERROR", "confidence": 0, "reasons": ["All model fallbacks failed"]}
 
 
 # ------------------------------------------------------------------------------
