@@ -8,9 +8,7 @@ import streamlit as st
 import yfinance as yf
 from groq import Groq, APIError
 
-# ------------------------------------------------------------------------------
 # Configuration & Setup
-# ------------------------------------------------------------------------------
 st.set_page_config(page_title="AI Trading Dashboard", layout="wide")
 
 ASSET_MAP = {
@@ -28,7 +26,7 @@ def fetch_live_price(ticker_symbol: str) -> dict:
         ticker = yf.Ticker(ticker_symbol)
         data = ticker.history(period="1d", interval="1m")
         if data.empty:
-            return {"price": None, "change": None, "status": "No data found"}
+            return {"price": "None", "change": "None", "status": "No Data"}
         
         latest_price = float(data["Close"].iloc[-1])
         open_price = float(data["Open"].iloc[0])
@@ -40,43 +38,44 @@ def fetch_live_price(ticker_symbol: str) -> dict:
             "status": "Success"
         }
     except Exception as e:
-        return {"price": None, "change": None, "status": str(e)}
+        return {"price": "None", "change": "None", "status": str(e)}
+
 
 def scrape_forex_factory_news() -> list:
     """Scrape high-impact economic news events from Forex Factory."""
     url = "https://www.forexfactory.com/calendar"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
     events = []
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
             rows = soup.find_all("tr", class_="calendar__row")
             for row in rows:
                 impact = row.find("td", class_="calendar__impact")
-                if impact and impact.find("span", class_="high"):
+                if impact and impact.find("span", class_="icon--ff-impact-red"):
                     currency = row.find("td", class_="calendar__currency")
-                    currency_text = currency.text.strip() if currency else "USD"
+                    title = row.find("td", class_="calendar__event")
+                    time = row.find("td", class_="calendar__time")
                     
-                    event_title = row.find("td", class_="calendar__event")
-                    title_text = event_title.text.strip() if event_title else "High Impact Event"
-                    
-                    time_val = row.find("td", class_="calendar__time")
-                    time_text = time_val.text.strip() if time_val else "TBA"
+                    currency_text = currency.text.strip() if currency else ""
+                    event_title = title.text.strip() if title else ""
+                    time_val = time.text.strip() if time else ""
                     
                     events.append({
-                        "time": time_text,
+                        "time": time_val,
                         "currency": currency_text,
-                        "title": title_text
+                        "title": event_title
                     })
     except Exception:
         pass
     return events
 
+
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
-    """Send an automated alert message via Telegram."""
+    """Send an automated alert message via Telegram Bot API."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
@@ -85,27 +84,29 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
     except Exception:
         return False
 
+
 # ------------------------------------------------------------------------------
 # Groq AI Inference Function
 # ------------------------------------------------------------------------------
-# List of models in order of preference
 MODEL_FALLBACKS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
+    "mixtral-8x7b-32768"
 ]
 
-def generate_groq_signal(asset, price_data, news_data, api_key):
+
+def generate_groq_signal(asset: str, price_data: dict, news_data: list, api_key: str) -> dict:
+    """Generate trade signal and reasoning using Groq API with model fallbacks."""
     if not api_key:
         return {"signal": "ERROR", "confidence": 0, "reasons": ["Groq API key missing"]}
 
     client = Groq(api_key=api_key)
 
     prompt = f"""
-    You are an expert AI trading strategist. Analyze the following data for {asset}:
+    You are an expert AI trading strategist. Analyze the following market data for {asset}:
     - Current Price: {price_data.get('price')}
     - Daily Change (%): {price_data.get('change'):.2f}%
-    - News: {json.dumps(news_data, indent=2)}
+    - High-Impact News: {json.dumps(news_data, indent=2)}
 
     Provide your response in strictly VALID JSON format matching this schema:
     {{
@@ -127,7 +128,7 @@ def generate_groq_signal(asset, price_data, news_data, api_key):
             return json.loads(raw_content)
         except APIError as e:
             if e.status_code == 404 or "model_not_found" in str(e):
-                st.warning(f"Model {model} unavailable, trying fallback...")
+                st.warning(f"Model {model} unavailable, attempting fallback...")
                 continue
             else:
                 st.error(f"Groq API Error: {e.message}")
@@ -139,17 +140,21 @@ def generate_groq_signal(asset, price_data, news_data, api_key):
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All models failed"]}
 
 
-
 # ------------------------------------------------------------------------------
 # Streamlit User Interface
 # ------------------------------------------------------------------------------
 st.title("📈 AI Trading Assistant Dashboard")
 
+# Load Credentials from st.secrets if available
+default_groq_key = st.secrets.get("GROQ_API_KEY", "")
+default_telegram_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+default_telegram_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
+
 # Sidebar - Settings & Credentials
 st.sidebar.header("🔑 Credentials & Setup")
-groq_key = st.sidebar.text_input("Groq API Key", type="password")
-telegram_token = st.sidebar.text_input("Telegram Bot Token", type="password")
-telegram_chat_id = st.sidebar.text_input("Telegram Chat ID")
+groq_key = st.sidebar.text_input("Groq API Key", value=default_groq_key, type="password")
+telegram_token = st.sidebar.text_input("Telegram Bot Token", value=default_telegram_token, type="password")
+telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=default_telegram_chat_id)
 
 st.sidebar.markdown("---")
 st.sidebar.header("📌 Asset Selection")
@@ -187,7 +192,7 @@ with col2:
     st.subheader("Signal Generation")
     if st.button("Generate Signal & Dispatch Alert"):
         if not groq_key:
-            st.error("Please provide your Groq API Key in the sidebar.")
+            st.error("Please provide your Groq API Key in the sidebar or app secrets.")
         else:
             with st.spinner("Analyzing market structure & news..."):
                 signal_data = generate_groq_signal(
