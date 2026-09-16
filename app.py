@@ -10,7 +10,7 @@ from groq import Groq, APIError
 # ------------------------------------------------------------------------------
 # Configuration & Session State
 # ------------------------------------------------------------------------------
-st.set_page_config(page_title="AI Trading Assistant & Position Tracker", layout="wide")
+st.set_page_config(page_title="AI Trading Assistant & Multi-Trade Tracker", layout="wide")
 
 STATE_FILE = "trade_state.json"
 
@@ -29,39 +29,47 @@ if "telegram_chat_id" not in st.session_state:
     st.session_state["telegram_chat_id"] = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
 # ------------------------------------------------------------------------------
-# Persistence Layer (Remembers Signals)
+# Persistence Layer (Stores & Keeps Last 5 Trades)
 # ------------------------------------------------------------------------------
-def save_active_signal(signal_data: dict):
-    """Saves the latest generated signal to Streamlit state and trade_state.json."""
-    st.session_state["active_signal"] = signal_data
-    with open(STATE_FILE, "w") as f:
-        json.dump(signal_data, f, indent=4)
-
-def load_active_signal() -> dict:
-    """Retrieves active signal from session state or trade_state.json file."""
-    if "active_signal" in st.session_state:
-        return st.session_state["active_signal"]
+def load_trade_history() -> list:
+    """Loads trade history from session state or trade_state.json file."""
+    if "trade_history" in st.session_state:
+        return st.session_state["trade_history"]
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                st.session_state["active_signal"] = data
-                return data
+                history = json.load(f)
+                if isinstance(history, list):
+                    st.session_state["trade_history"] = history
+                    return history
         except Exception:
-            return None
-    return None
+            pass
+    st.session_state["trade_history"] = []
+    return []
 
-def clear_active_signal():
-    """Removes stored signal state when a trade is closed."""
-    st.session_state.pop("active_signal", None)
+def save_new_signal(signal_data: dict):
+    """Appends a new signal, keeping only the last 5 trades in storage."""
+    history = load_trade_history()
+    history.append(signal_data)
+    
+    # Keep strictly the last 5 trades
+    if len(history) > 5:
+        history = history[-5:]
+        
+    st.session_state["trade_history"] = history
+    with open(STATE_FILE, "w") as f:
+        json.dump(history, f, indent=4)
+
+def clear_all_trade_records():
+    """Wipes stored trade history."""
+    st.session_state["trade_history"] = []
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
 
 # ------------------------------------------------------------------------------
-# Data Fetching & Telegram Notifications
+# Data Fetching & Telegram Dispatcher
 # ------------------------------------------------------------------------------
 def fetch_live_price(ticker_symbol: str) -> dict:
-    """Fetch latest price and daily change from yfinance."""
     try:
         ticker = yf.Ticker(ticker_symbol)
         data = ticker.history(period="1d", interval="1m")
@@ -72,16 +80,11 @@ def fetch_live_price(ticker_symbol: str) -> dict:
         open_price = float(data["Open"].iloc[0])
         pct_change = ((latest_price - open_price) / open_price) * 100
         
-        return {
-            "price": latest_price,
-            "change": pct_change,
-            "status": "Success"
-        }
+        return {"price": latest_price, "change": pct_change, "status": "Success"}
     except Exception as e:
         return {"price": 0.0, "change": 0.0, "status": str(e)}
 
 def scrape_forex_factory_news() -> list:
-    """Scrapes high-impact economic calendar events."""
     url = "https://www.forexfactory.com/calendar"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     events = []
@@ -96,7 +99,6 @@ def scrape_forex_factory_news() -> list:
                     currency = row.find("td", class_="calendar__currency")
                     title = row.find("td", class_="calendar__event")
                     time_elem = row.find("td", class_="calendar__time")
-                    
                     events.append({
                         "time": time_elem.text.strip() if time_elem else "",
                         "currency": currency.text.strip() if currency else "",
@@ -107,7 +109,6 @@ def scrape_forex_factory_news() -> list:
     return events
 
 def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
-    """Sends Markdown formatted alert to your phone via Telegram."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
@@ -117,8 +118,15 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
         return False
 
 # ------------------------------------------------------------------------------
-# Groq Signal Generator
+# Order Type Resolver & Groq Signal Generator
 # ------------------------------------------------------------------------------
+def determine_order_type(action: str, entry_price: float, current_price: float) -> str:
+    """Determines exact execution order type based on current market price."""
+    if action == "BUY":
+        return "BUY STOP" if entry_price > current_price else "BUY LIMIT"
+    else:  # SELL
+        return "SELL STOP" if entry_price < current_price else "SELL LIMIT"
+
 MODEL_FALLBACKS = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.6-27b",
@@ -130,21 +138,18 @@ def generate_groq_signal(asset: str, price_data: dict, news_data: list, timefram
         return {"signal": "ERROR", "confidence": 0, "reasons": ["Groq API key missing"]}
 
     client = Groq(api_key=api_key)
-    news_str = json.dumps(news_data, indent=2)
-    current_price = str(price_data.get("price"))
-    daily_change = str(price_data.get("change"))
+    current_price = price_data.get("price", 0.0)
 
     prompt = f"""
 You are an institutional trading analyst. Analyze parameters for {asset}:
 - Timeframe: {timeframe}
 - Current Price: {current_price}
-- Daily Change (%): {daily_change}
-- High-Impact News Today: {news_str}
+- Daily Change (%): {price_data.get('change')}
+- High-Impact News: {json.dumps(news_data, indent=2)}
 
-Return ONLY a raw JSON object matching this schema without markdown fences or text:
+Return ONLY a raw JSON object matching this schema without markdown formatting:
 {{
     "signal": "BUY",
-    "order_type": "BUY LIMIT",
     "entry_price": 0.0,
     "stop_loss": 0.0,
     "take_profit_1": 0.0,
@@ -164,14 +169,18 @@ Return ONLY a raw JSON object matching this schema without markdown fences or te
             )
             raw_content = response.choices[0].message.content.strip()
             
-            if raw_content.startswith("```json"):
-                raw_content = raw_content[7:]
-            if raw_content.startswith("```"):
-                raw_content = raw_content[3:]
-            if raw_content.endswith("```"):
-                raw_content = raw_content[:-3]
+            if raw_content.startswith("```json"): raw_content = raw_content[7:]
+            if raw_content.startswith("```"): raw_content = raw_content[3:]
+            if raw_content.endswith("```"): raw_content = raw_content[:-3]
                 
-            return json.loads(raw_content.strip())
+            signal_obj = json.loads(raw_content.strip())
+            
+            # Resolve specific Order Type (Limit vs Stop)
+            sig_action = signal_obj.get("signal", "BUY").upper()
+            entry_p = float(signal_obj.get("entry_price", current_price))
+            signal_obj["order_type"] = determine_order_type(sig_action, entry_p, current_price)
+            
+            return signal_obj
         except APIError as e:
             if e.status_code in [400, 404] or "decommissioned" in str(e).lower():
                 continue
@@ -182,19 +191,17 @@ Return ONLY a raw JSON object matching this schema without markdown fences or te
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
-# Check Status Logic
+# Multi-Trade Status Evaluator
 # ------------------------------------------------------------------------------
-def evaluate_trade_status(saved_signal: dict, current_price: float) -> tuple:
-    """Compares saved signal with live market price and produces trade advice."""
+def evaluate_trade_status(saved_signal: dict, current_price: float) -> dict:
     action = saved_signal.get("signal", "BUY").upper()
     entry = float(saved_signal.get("entry_price", 0.0))
     sl = float(saved_signal.get("stop_loss", 0.0))
     tp1 = float(saved_signal.get("take_profit_1", 0.0))
 
     if entry == 0.0 or sl == 0.0:
-        return "UNKNOWN", "Invalid entry or stop loss level in recorded trade."
+        return {"recommendation": "UNKNOWN", "analysis": "Invalid levels."}
 
-    # Pip/Point determination
     is_gold = "GC=F" in saved_signal.get("ticker", "") or "Gold" in saved_signal.get("asset", "")
     point = 0.1 if is_gold else 0.0001
 
@@ -209,17 +216,19 @@ def evaluate_trade_status(saved_signal: dict, current_price: float) -> tuple:
 
     if rr_achieved >= 1.0:
         recommendation = "TRAIL SL TO BREAKEVEN"
-        analysis = f"🎯 1:1 Risk-to-Reward reached (+{pnl_pips:.1f} pips). Move Stop Loss to Entry ({entry}) to lock in a risk-free trade."
+        analysis = f"🎯 1:1 R:R achieved (+{pnl_pips:.1f} pips). Lock SL to entry ({entry})."
     elif pnl_pips < -(risk_pips * 0.75):
         recommendation = "EARLY EXIT / CLOSE"
-        analysis = f"⚠️ Trade is in severe drawdown (-{abs(pnl_pips):.1f} pips), approaching SL ({sl}). Market structure has invalidated."
+        analysis = f"⚠️ Severe drawdown (-{abs(pnl_pips):.1f} pips). Structure invalidated."
     else:
         recommendation = "HOLD POSITION"
-        analysis = f"⏳ Setup structure is healthy. Current PnL: {pnl_pips:+.1f} pips. Target TP: {tp1}."
+        analysis = f"⏳ Setup intact. PnL: {pnl_pips:+.1f} pips. TP: {tp1}."
 
-    report = {
-        "action": action,
-        "asset": saved_signal.get("asset", "Asset"),
+    return {
+        "id": saved_signal.get("id"),
+        "timestamp": saved_signal.get("timestamp"),
+        "asset": saved_signal.get("asset"),
+        "order_type": saved_signal.get("order_type"),
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
@@ -229,8 +238,6 @@ def evaluate_trade_status(saved_signal: dict, current_price: float) -> tuple:
         "recommendation": recommendation,
         "analysis": analysis
     }
-
-    return recommendation, report
 
 # ------------------------------------------------------------------------------
 # Dashboard UI Layout
@@ -256,8 +263,7 @@ selected_timeframe = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1D"]
 
 news_list = scrape_forex_factory_news()
 
-# Main App Tabs
-tab1, tab2 = st.tabs(["⚡ Generate Signal", "🔍 Check Status"])
+tab1, tab2 = st.tabs(["⚡ Generate Signal", "🔍 Check Status (Last 5 Trades)"])
 
 # ------------------------------------------------------------------------------
 # TAB 1: SIGNAL GENERATION
@@ -286,17 +292,19 @@ with tab1:
                     
                     sig = setup.get("signal", "NEUTRAL")
                     if sig in ["BUY", "SELL"]:
+                        setup["id"] = f"TRADE-{pd.Timestamp.now().strftime('%M%S')}"
+                        setup["timestamp"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
                         setup["asset"] = selected_asset_label
                         setup["ticker"] = selected_ticker
                         setup["timeframe"] = selected_timeframe
                         
-                        # Save signal to memory and disk
-                        save_active_signal(setup)
+                        # Save signal to history list
+                        save_new_signal(setup)
 
                         st.success(f"### {setup.get('order_type')} ({sig}) — {setup.get('confidence')}% Confidence")
                         
                         m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("Entry", setup.get("entry_price"))
+                        m1.metric("Entry Price", setup.get("entry_price"))
                         m2.metric("Stop Loss", setup.get("stop_loss"))
                         m3.metric("Take Profit 1", setup.get("take_profit_1"))
                         m4.metric("Take Profit 2", setup.get("take_profit_2"))
@@ -310,7 +318,7 @@ with tab1:
                             msg = (
                                 f"📲 *NEW AI SIGNAL DISPATCH*\n\n"
                                 f"📌 *Asset:* {selected_asset_label} ({selected_timeframe})\n"
-                                f"⚡ *Action:* `{setup.get('order_type')}`\n"
+                                f"⚡ *Order Type:* `{setup.get('order_type')}`\n"
                                 f"📊 *Confidence:* {setup.get('confidence')}%\n\n"
                                 f"🎯 *Entry:* `{setup.get('entry_price')}`\n"
                                 f"🛑 *Stop Loss:* `{setup.get('stop_loss')}`\n"
@@ -327,62 +335,51 @@ with tab1:
                         st.warning(f"No clear setup found: {setup.get('reasons')}")
 
 # ------------------------------------------------------------------------------
-# TAB 2: CHECK TRADE STATUS
+# TAB 2: CHECK STATUS (LAST 5 TRADES)
 # ------------------------------------------------------------------------------
 with tab2:
-    st.subheader("🔍 Active Position Status Check")
-    saved_trade = load_active_signal()
+    st.subheader("🔍 Status Check — Last 5 Executed Trades")
+    trade_history = load_trade_history()
 
-    if not saved_trade:
-        st.info("No recorded signal currently active. Generate a signal in Tab 1 first.")
+    if not trade_history:
+        st.info("No saved trades found in memory. Generate a signal in Tab 1 first.")
     else:
-        st.markdown(
-            f"**Active Signal Memory:** `{saved_trade.get('signal')}` on `{saved_trade.get('asset')}` "
-            f"| Entry: `{saved_trade.get('entry_price')}` | SL: `{saved_trade.get('stop_loss')}` | TP1: `{saved_trade.get('take_profit_1')}`"
-        )
+        st.write(f"Showing **{len(trade_history)} active/recent trade(s)** stored in `trade_state.json`:")
 
-        if st.button("Check Trade Status Now", type="primary"):
-            ticker_to_check = saved_trade.get("ticker", selected_ticker)
-            live_data = fetch_live_price(ticker_to_check)
-
-            if live_data["status"] != "Success":
-                st.error("Could not pull live price to evaluate status.")
-            else:
-                curr_price = live_data["price"]
-                rec, report = evaluate_trade_status(saved_trade, curr_price)
-
-                # Visual recommendation banner
-                if "TRAIL" in rec:
-                    st.success(f"### AI Recommendation: {rec}")
-                elif "EXIT" in rec or "CLOSE" in rec:
-                    st.error(f"### AI Recommendation: {rec}")
-                else:
-                    st.info(f"### AI Recommendation: {rec}")
-
-                # Metric cards
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Live Market Price", f"{report['current_price']:.4f}")
-                c2.metric("Floating PnL (Pips)", f"{report['pnl_pips']:+} pips")
-                c3.metric("R:R Ratio Reached", f"1:{report['rr_achieved']}")
-
-                st.write(f"**Detailed Analysis:** {report['analysis']}")
-
-                # Dispatch recommendation update to Telegram
-                if telegram_token and telegram_chat_id:
-                    tg_update = (
-                        f"📊 *POSITION STATUS UPDATE*\n\n"
-                        f"📌 *Asset:* {report['asset']}\n"
-                        f"⚡ *Signal:* {report['action']} @ {report['entry']}\n"
-                        f"📈 *Current Price:* {report['current_price']:.4f}\n"
-                        f"💰 *PnL:* {report['pnl_pips']:+} pips\n\n"
-                        f"💡 *AI Action:* *{report['recommendation']}*\n"
-                        f"📝 {report['analysis']}"
+        if st.button("🔄 Check Status For All Trades", type="primary"):
+            reports = []
+            
+            # Evaluate each trade in history (newest to oldest)
+            for trade in reversed(trade_history):
+                ticker = trade.get("ticker", selected_ticker)
+                live_data = fetch_live_price(ticker)
+                
+                if live_data["status"] == "Success":
+                    rep = evaluate_trade_status(trade, live_data["price"])
+                    reports.append(rep)
+                    
+                    with st.expander(f"📌 {rep['asset']} | {rep['order_type']} @ {rep['entry']} ({trade.get('timestamp')})", expanded=True):
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Live Price", f"{rep['current_price']:.4f}")
+                        c2.metric("Floating PnL", f"{rep['pnl_pips']:+} pips")
+                        c3.metric("R:R Reached", f"1:{rep['rr_achieved']}")
+                        c4.write(f"**Action:** `{rep['recommendation']}`")
+                        
+                        st.write(f"**Analysis:** {rep['analysis']}")
+            
+            # Broadcast multi-trade summary report to Telegram
+            if reports and telegram_token and telegram_chat_id:
+                summary_lines = ["📊 *MULTI-TRADE STATUS REPORT*\n"]
+                for r in reports:
+                    summary_lines.append(
+                        f"• *{r['asset']}* ({r['order_type']})\n"
+                        f"  PnL: `{r['pnl_pips']:+} pips` | Action: *{r['recommendation']}*\n"
                     )
-                    send_telegram_alert(telegram_token, telegram_chat_id, tg_update)
-                    st.caption("Status update pushed to your Telegram.")
+                send_telegram_alert(telegram_token, telegram_chat_id, "\n".join(summary_lines))
+                st.caption("Combined report pushed to Telegram!")
 
         st.markdown("---")
-        if st.button("Clear / Close Saved Trade Record"):
-            clear_active_signal()
-            st.success("Trade state cleared from memory.")
+        if st.button("🗑️ Clear All 5 Saved Trades"):
+            clear_all_trade_records()
+            st.success("Trade state file cleared!")
             st.rerun()
