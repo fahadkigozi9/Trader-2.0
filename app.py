@@ -184,10 +184,9 @@ Return ONLY a raw JSON object matching this schema without markdown formatting:
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
-# Backtesting Engine
+# Fixed Backtesting Engine (Sequential Position Tracking)
 # ------------------------------------------------------------------------------
 def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int, signal_data: dict) -> dict:
-    """Backtests the AI setup parameters over historical candles."""
     yf_interval_map = {"15m": "15m", "1h": "1h", "4h": "1h", "1D": "1d"}
     interval = yf_interval_map.get(timeframe, "1h")
     
@@ -204,32 +203,45 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
         if entry == 0.0 or sl == 0.0 or tp == 0.0:
             return {"error": "Invalid target price levels for strategy backtest."}
             
-        trades = []
         is_gold = "GC=F" in ticker_symbol or "Gold" in ticker_symbol
         point = 0.1 if is_gold else 0.0001
         
-        # Simple simulated execution engine
+        trades = []
+        in_position = False
+        
         for i in range(len(df)):
-            high = df["High"].iloc[i].item() if isinstance(df["High"].iloc[i], pd.Series) else float(df["High"].iloc[i])
-            low = df["Low"].iloc[i].item() if isinstance(df["Low"].iloc[i], pd.Series) else float(df["Low"].iloc[i])
+            high = float(df["High"].iloc[i])
+            low = float(df["Low"].iloc[i])
             
-            if action == "BUY":
-                if low <= sl:
-                    pips = (sl - entry) / point
-                    trades.append({"result": "LOSS", "pips": pips})
-                elif high >= tp:
-                    pips = (tp - entry) / point
-                    trades.append({"result": "WIN", "pips": pips})
-            else:  # SELL
-                if high >= sl:
-                    pips = (entry - sl) / point
-                    trades.append({"result": "LOSS", "pips": pips})
-                elif low <= tp:
-                    pips = (entry - tp) / point
-                    trades.append({"result": "WIN", "pips": pips})
+            # 1. Trigger Entry if not currently in a trade
+            if not in_position:
+                if (action == "BUY" and low <= entry <= high) or (action == "SELL" and low <= entry <= high):
+                    in_position = True
+                continue
+
+            # 2. Evaluate Exit conditions for active position
+            if in_position:
+                if action == "BUY":
+                    if low <= sl:
+                        pips = (sl - entry) / point
+                        trades.append({"result": "LOSS", "pips": pips})
+                        in_position = False
+                    elif high >= tp:
+                        pips = (tp - entry) / point
+                        trades.append({"result": "WIN", "pips": pips})
+                        in_position = False
+                else:  # SELL
+                    if high >= sl:
+                        pips = (entry - sl) / point
+                        trades.append({"result": "LOSS", "pips": pips})
+                        in_position = False
+                    elif low <= tp:
+                        pips = (entry - tp) / point
+                        trades.append({"result": "WIN", "pips": pips})
+                        in_position = False
 
         if not trades:
-            return {"error": "No execution triggers were met in the selected historical period."}
+            return {"error": "No completed trade cycles triggered in this historical window."}
 
         total_trades = len(trades)
         wins = sum(1 for t in trades if t["result"] == "WIN")
