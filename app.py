@@ -3,6 +3,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+import numpy as np
 import streamlit as st
 import yfinance as yf
 from groq import Groq, APIError
@@ -10,7 +11,7 @@ from groq import Groq, APIError
 # ------------------------------------------------------------------------------
 # Configuration & Session State
 # ------------------------------------------------------------------------------
-st.set_page_config(page_title="AI Trading Assistant & Multi-Trade Tracker", layout="wide")
+st.set_page_config(page_title="AI Trading Assistant & Strategy Backtester", layout="wide")
 
 STATE_FILE = "trade_state.json"
 
@@ -29,10 +30,9 @@ if "telegram_chat_id" not in st.session_state:
     st.session_state["telegram_chat_id"] = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
 # ------------------------------------------------------------------------------
-# Persistence Layer (Stores ALL Trades Permanently)
+# Persistence Layer
 # ------------------------------------------------------------------------------
 def load_trade_history() -> list:
-    """Loads trade history from session state or trade_state.json file."""
     if "trade_history" in st.session_state:
         return st.session_state["trade_history"]
     if os.path.exists(STATE_FILE):
@@ -48,28 +48,24 @@ def load_trade_history() -> list:
     return []
 
 def save_new_signal(signal_data: dict):
-    """Appends a new signal, storing ALL trades without a limit."""
     history = load_trade_history()
     history.append(signal_data)
-        
     st.session_state["trade_history"] = history
     with open(STATE_FILE, "w") as f:
         json.dump(history, f, indent=4)
 
 def save_all_trades(history: list):
-    """Saves updated trade history list directly to file and session."""
     st.session_state["trade_history"] = history
     with open(STATE_FILE, "w") as f:
         json.dump(history, f, indent=4)
 
 def clear_all_trade_records():
-    """Wipes stored trade history."""
     st.session_state["trade_history"] = []
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
 
 # ------------------------------------------------------------------------------
-# Data Fetching & Telegram Dispatcher
+# Market Data & Telegram Operations
 # ------------------------------------------------------------------------------
 def fetch_live_price(ticker_symbol: str) -> dict:
     try:
@@ -123,10 +119,9 @@ def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
 # Order Type Resolver & Groq Signal Generator
 # ------------------------------------------------------------------------------
 def determine_order_type(action: str, entry_price: float, current_price: float) -> str:
-    """Determines exact execution order type based on current market price."""
     if action == "BUY":
         return "BUY STOP" if entry_price > current_price else "BUY LIMIT"
-    else:  # SELL
+    else:
         return "SELL STOP" if entry_price < current_price else "SELL LIMIT"
 
 MODEL_FALLBACKS = [
@@ -170,17 +165,14 @@ Return ONLY a raw JSON object matching this schema without markdown formatting:
                 temperature=0.2,
             )
             raw_content = response.choices[0].message.content.strip()
-            
             if raw_content.startswith("```json"): raw_content = raw_content[7:]
             if raw_content.startswith("```"): raw_content = raw_content[3:]
             if raw_content.endswith("```"): raw_content = raw_content[:-3]
                 
             signal_obj = json.loads(raw_content.strip())
-            
             sig_action = signal_obj.get("signal", "BUY").upper()
             entry_p = float(signal_obj.get("entry_price", current_price))
             signal_obj["order_type"] = determine_order_type(sig_action, entry_p, current_price)
-            
             return signal_obj
         except APIError as e:
             if e.status_code in [400, 404] or "decommissioned" in str(e).lower():
@@ -192,29 +184,87 @@ Return ONLY a raw JSON object matching this schema without markdown formatting:
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
+# Backtesting Engine
+# ------------------------------------------------------------------------------
+def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int, signal_data: dict) -> dict:
+    """Backtests the AI setup parameters over historical candles."""
+    yf_interval_map = {"15m": "15m", "1h": "1h", "4h": "1h", "1D": "1d"}
+    interval = yf_interval_map.get(timeframe, "1h")
+    
+    try:
+        df = yf.download(ticker_symbol, period=f"{lookback_days}d", interval=interval)
+        if df.empty:
+            return {"error": "Failed to fetch historical data for backtesting."}
+            
+        action = signal_data.get("signal", "BUY").upper()
+        entry = float(signal_data.get("entry_price", 0.0))
+        sl = float(signal_data.get("stop_loss", 0.0))
+        tp = float(signal_data.get("take_profit_1", 0.0))
+        
+        if entry == 0.0 or sl == 0.0 or tp == 0.0:
+            return {"error": "Invalid target price levels for strategy backtest."}
+            
+        trades = []
+        is_gold = "GC=F" in ticker_symbol or "Gold" in ticker_symbol
+        point = 0.1 if is_gold else 0.0001
+        
+        # Simple simulated execution engine
+        for i in range(len(df)):
+            high = df["High"].iloc[i].item() if isinstance(df["High"].iloc[i], pd.Series) else float(df["High"].iloc[i])
+            low = df["Low"].iloc[i].item() if isinstance(df["Low"].iloc[i], pd.Series) else float(df["Low"].iloc[i])
+            
+            if action == "BUY":
+                if low <= sl:
+                    pips = (sl - entry) / point
+                    trades.append({"result": "LOSS", "pips": pips})
+                elif high >= tp:
+                    pips = (tp - entry) / point
+                    trades.append({"result": "WIN", "pips": pips})
+            else:  # SELL
+                if high >= sl:
+                    pips = (entry - sl) / point
+                    trades.append({"result": "LOSS", "pips": pips})
+                elif low <= tp:
+                    pips = (entry - tp) / point
+                    trades.append({"result": "WIN", "pips": pips})
+
+        if not trades:
+            return {"error": "No execution triggers were met in the selected historical period."}
+
+        total_trades = len(trades)
+        wins = sum(1 for t in trades if t["result"] == "WIN")
+        losses = total_trades - wins
+        win_rate = (wins / total_trades) * 100
+        net_pips = sum(t["pips"] for t in trades)
+
+        return {
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 2),
+            "net_pips": round(net_pips, 1),
+            "trades_detail": trades
+        }
+    except Exception as e:
+        return {"error": f"Backtest failure: {str(e)}"}
+
+# ------------------------------------------------------------------------------
 # Post-Mortem Failure Analysis Engine
 # ------------------------------------------------------------------------------
 def analyze_failed_trade(trade: dict, live_price: float, api_key: str) -> str:
-    """Uses Groq AI to evaluate why a trade hit its Stop Loss."""
     if not api_key:
-        return "Groq API key is required to perform failure analysis."
+        return "Groq API key required."
 
     client = Groq(api_key=api_key)
     prompt = f"""
-You are an expert forex risk manager. Perform a post-mortem failure analysis on a trade setup that hit its STOP LOSS:
+Perform a post-mortem failure analysis on a trade setup that hit its STOP LOSS:
 - Asset: {trade.get('asset')}
 - Order Type: {trade.get('order_type')}
 - Entry Price: {trade.get('entry_price')}
 - Stop Loss: {trade.get('stop_loss')}
-- Take Profit: {trade.get('take_profit_1')}
-- Current/Exit Price: {live_price}
-- Original Confidence: {trade.get('confidence')}%
-- Original Setup Reasons: {json.dumps(trade.get('reasons', []))}
+- Exit Price: {live_price}
 
-Provide a concise 3-bullet point breakdown explaining:
-1. What went wrong (e.g. liquidity sweep, news reaction, tight SL).
-2. Market structure/bias error.
-3. Key takeaway/lesson to avoid similar stop loss hits in future setups.
+Provide a concise 3-bullet point breakdown explaining what went wrong and key learnings.
 """
 
     for model in MODEL_FALLBACKS:
@@ -228,7 +278,7 @@ Provide a concise 3-bullet point breakdown explaining:
         except Exception:
             continue
 
-    return "Unable to generate post-mortem analysis at this time."
+    return "Unable to generate failure analysis."
 
 # ------------------------------------------------------------------------------
 # Multi-Trade Status Evaluator
@@ -258,13 +308,10 @@ def evaluate_trade_status(saved_signal: dict, current_price: float) -> dict:
 
     if hit_sl:
         recommendation = "STOP LOSS HIT"
-        analysis = f"❌ Trade invalidated. Price hit SL ({sl}). PnL: {pnl_pips:.1f} pips."
+        analysis = f"❌ Trade invalidated. Hit SL ({sl}). PnL: {pnl_pips:.1f} pips."
     elif rr_achieved >= 1.0:
         recommendation = "TRAIL SL TO BREAKEVEN"
         analysis = f"🎯 1:1 R:R achieved (+{pnl_pips:.1f} pips). Lock SL to entry ({entry})."
-    elif pnl_pips < -(risk_pips * 0.75):
-        recommendation = "EARLY EXIT / CLOSE"
-        analysis = f"⚠️ Severe drawdown (-{abs(pnl_pips):.1f} pips). Structure invalidated."
     else:
         recommendation = "HOLD POSITION"
         analysis = f"⏳ Setup intact. PnL: {pnl_pips:+.1f} pips. TP: {tp1}."
@@ -288,7 +335,7 @@ def evaluate_trade_status(saved_signal: dict, current_price: float) -> dict:
 # ------------------------------------------------------------------------------
 # Dashboard UI Layout
 # ------------------------------------------------------------------------------
-st.title("📊 AI Trading Assistant & Position Tracker")
+st.title("📊 AI Trading Assistant & Strategy Backtester")
 
 # Sidebar
 st.sidebar.header("🔑 Credentials")
@@ -309,7 +356,12 @@ selected_timeframe = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1D"]
 
 news_list = scrape_forex_factory_news()
 
-tab1, tab2, tab3 = st.tabs(["⚡ Generate Signal", "🔍 Check Status", "🩺 Post-Mortem Analysis"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "⚡ Generate Signal", 
+    "🔍 Check Status", 
+    "🩺 Post-Mortem Analysis", 
+    "🧪 Strategy Backtester"
+])
 
 # ------------------------------------------------------------------------------
 # TAB 1: SIGNAL GENERATION
@@ -346,6 +398,7 @@ with tab1:
                         setup["status"] = "ACTIVE"
                         
                         save_new_signal(setup)
+                        st.session_state["latest_signal"] = setup
 
                         st.success(f"### {setup.get('order_type')} ({sig}) — {setup.get('confidence')}% Confidence")
                         
@@ -372,28 +425,24 @@ with tab1:
                                 f"⚖️ *R:R:* {setup.get('risk_reward_ratio')}\n\n"
                                 f"💡 *Rationale:*\n" + "\n".join([f"• {reason}" for reason in setup.get("reasons", [])])
                             )
-                            if send_telegram_alert(telegram_token, telegram_chat_id, msg):
-                                st.success("Signal alert pushed to Telegram!")
-                            else:
-                                st.error("Failed to deliver Telegram notification.")
+                            send_telegram_alert(telegram_token, telegram_chat_id, msg)
                     else:
                         st.warning(f"No clear setup found: {setup.get('reasons')}")
 
 # ------------------------------------------------------------------------------
-# TAB 2: CHECK STATUS (ALL TRADES)
+# TAB 2: CHECK STATUS
 # ------------------------------------------------------------------------------
 with tab2:
     st.subheader("🔍 Status Check — All Stored Trades")
     trade_history = load_trade_history()
 
     if not trade_history:
-        st.info("No saved trades found in memory. Generate a signal in Tab 1 first.")
+        st.info("No saved trades found in memory.")
     else:
         st.write(f"Showing **{len(trade_history)} total trade(s)** stored in `trade_state.json`:")
 
         if st.button("🔄 Check Status For All Trades", type="primary"):
             reports = []
-            
             for trade in reversed(trade_history):
                 ticker = trade.get("ticker", selected_ticker)
                 live_data = fetch_live_price(ticker)
@@ -412,54 +461,75 @@ with tab2:
                         c2.metric("Floating PnL", f"{rep['pnl_pips']:+} pips")
                         c3.metric("R:R Reached", f"1:{rep['rr_achieved']}")
                         c4.write(f"**Action:** `{rep['recommendation']}`")
-                        
                         st.write(f"**Analysis:** {rep['analysis']}")
-            
-            if reports and telegram_token and telegram_chat_id:
-                summary_lines = ["📊 *MULTI-TRADE STATUS REPORT*\n"]
-                for r in reports:
-                    summary_lines.append(
-                        f"• *{r['asset']}* ({r['order_type']})\n"
-                        f"  PnL: `{r['pnl_pips']:+} pips` | Action: *{r['recommendation']}*\n"
-                    )
-                send_telegram_alert(telegram_token, telegram_chat_id, "\n".join(summary_lines))
-                st.caption("Combined report pushed to Telegram!")
-
-        st.markdown("---")
-        if st.button("🗑️ Clear All Stored Trades"):
-            clear_all_trade_records()
-            st.success("Trade state file cleared!")
-            st.rerun()
 
 # ------------------------------------------------------------------------------
-# TAB 3: POST-MORTEM ANALYSIS (FAILED TRADES)
+# TAB 3: POST-MORTEM ANALYSIS
 # ------------------------------------------------------------------------------
 with tab3:
     st.subheader("🩺 AI Post-Mortem Analysis on Failed Trades")
     trade_history = load_trade_history()
-    
     sl_trades = [t for t in trade_history if t.get("status") == "STOP LOSS HIT"]
 
     if not sl_trades:
-        st.info("No trades marked as 'STOP LOSS HIT' yet. Execute 'Check Status' in Tab 2 to detect trades that hit SL.")
+        st.info("No trades marked as 'STOP LOSS HIT' yet.")
     else:
-        st.write(f"Found **{len(sl_trades)} trade(s)** that hit Stop Loss:")
-
         for trade in reversed(sl_trades):
-            with st.expander(f"❌ {trade.get('asset')} ({trade.get('order_type')}) — Entry: {trade.get('entry_price')} | SL: {trade.get('stop_loss')}", expanded=True):
-                st.write(f"**Timestamp:** {trade.get('timestamp')}")
-                st.write(f"**Original Reasons:** {', '.join(trade.get('reasons', []))}")
-
+            with st.expander(f"❌ {trade.get('asset')} ({trade.get('order_type')}) — Entry: {trade.get('entry_price')}", expanded=True):
                 if "post_mortem" in trade:
-                    st.markdown("### 📋 AI Failure Analysis:")
                     st.write(trade["post_mortem"])
                 else:
                     if st.button(f"Analyze Why This Trade Failed ({trade.get('id')})", key=trade.get('id')):
                         live_data = fetch_live_price(trade.get("ticker", selected_ticker))
-                        with st.spinner("AI analyzing setup structure and market failure..."):
-                            analysis_result = analyze_failed_trade(
-                                trade, live_data.get("price", 0.0), groq_key
-                            )
-                            trade["post_mortem"] = analysis_result
-                            save_all_trades(trade_history)
-                            st.rerun()
+                        analysis_result = analyze_failed_trade(trade, live_data.get("price", 0.0), groq_key)
+                        trade["post_mortem"] = analysis_result
+                        save_all_trades(trade_history)
+                        st.rerun()
+
+# ------------------------------------------------------------------------------
+# TAB 4: STRATEGY BACKTESTER
+# ------------------------------------------------------------------------------
+with tab4:
+    st.subheader("🧪 Backtest AI Signal Setup against Historical Data")
+    
+    trade_history = load_trade_history()
+    
+    if not trade_history:
+        st.warning("Generate a trade signal first or select parameters manually to test.")
+    else:
+        selected_trade_id = st.selectbox(
+            "Select AI Signal to Backtest", 
+            options=[t.get("id") for t in reversed(trade_history)]
+        )
+        
+        target_trade = next((t for t in trade_history if t.get("id") == selected_trade_id), None)
+        
+        if target_trade:
+            st.json({
+                "Asset": target_trade.get("asset"),
+                "Signal": target_trade.get("signal"),
+                "Entry": target_trade.get("entry_price"),
+                "SL": target_trade.get("stop_loss"),
+                "TP": target_trade.get("take_profit_1")
+            })
+            
+            lookback = st.slider("Historical Lookback (Days)", min_value=5, max_value=60, value=30)
+            
+            if st.button("▶️ Run Backtest Engine", type="primary"):
+                with st.spinner("Simulating strategy across historical candles..."):
+                    res = run_strategy_backtest(
+                        target_trade.get("ticker", selected_ticker),
+                        target_trade.get("timeframe", "1h"),
+                        lookback,
+                        target_trade
+                    )
+                    
+                    if "error" in res:
+                        st.error(res["error"])
+                    else:
+                        st.success("Backtest Complete!")
+                        b1, b2, b3, b4 = st.columns(4)
+                        b1.metric("Total Executions", res["total_trades"])
+                        b2.metric("Win Rate", f"{res['win_rate']}%")
+                        b3.metric("Wins / Losses", f"{res['wins']} W / {res['losses']} L")
+                        b4.metric("Net Cumulative Pips", f"{res['net_pips']:+} pips")
