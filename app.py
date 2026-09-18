@@ -184,7 +184,7 @@ Return ONLY a raw JSON object matching this schema without markdown formatting:
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
-# Fixed Backtesting Engine (Sequential Position Tracking)
+# Fixed Backtesting Engine (Resolves MultiIndex and Series Casting Error)
 # ------------------------------------------------------------------------------
 def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int, signal_data: dict) -> dict:
     yf_interval_map = {"15m": "15m", "1h": "1h", "4h": "1h", "1D": "1d"}
@@ -195,6 +195,10 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
         if df.empty:
             return {"error": "Failed to fetch historical data for backtesting."}
             
+        # Flatten MultiIndex columns if present (yfinance DataFrame structure update fix)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
         action = signal_data.get("signal", "BUY").upper()
         entry = float(signal_data.get("entry_price", 0.0))
         sl = float(signal_data.get("stop_loss", 0.0))
@@ -210,8 +214,12 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
         in_position = False
         
         for i in range(len(df)):
-            high = float(df["High"].iloc[i])
-            low = float(df["Low"].iloc[i])
+            high_val = df["High"].iloc[i]
+            low_val = df["Low"].iloc[i]
+            
+            # Extract scalar cleanly whether iloc returns a Series or scalar
+            high = float(high_val.iloc[0]) if isinstance(high_val, pd.Series) else float(high_val)
+            low = float(low_val.iloc[0]) if isinstance(low_val, pd.Series) else float(low_val)
             
             # 1. Trigger Entry if not currently in a trade
             if not in_position:
