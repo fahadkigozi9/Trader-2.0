@@ -184,7 +184,7 @@ Return ONLY a raw JSON object matching this schema without markdown formatting:
     return {"signal": "ERROR", "confidence": 0, "reasons": ["All AI model fallbacks failed."]}
 
 # ------------------------------------------------------------------------------
-# Fixed Backtesting Engine (Resolves MultiIndex and Series Casting Error)
+# Fixed Backtesting Engine (Sequential Trades, Scalar Fix, & Asset Point Scaling)
 # ------------------------------------------------------------------------------
 def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int, signal_data: dict) -> dict:
     yf_interval_map = {"15m": "15m", "1h": "1h", "4h": "1h", "1D": "1d"}
@@ -195,7 +195,7 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
         if df.empty:
             return {"error": "Failed to fetch historical data for backtesting."}
             
-        # Flatten MultiIndex columns if present (yfinance DataFrame structure update fix)
+        # Flatten MultiIndex columns returned by newer yfinance releases
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -207,8 +207,13 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
         if entry == 0.0 or sl == 0.0 or tp == 0.0:
             return {"error": "Invalid target price levels for strategy backtest."}
             
-        is_gold = "GC=F" in ticker_symbol or "Gold" in ticker_symbol
-        point = 0.1 if is_gold else 0.0001
+        # Asset-specific point scaling resolution
+        if "GC=F" in ticker_symbol or "Gold" in ticker_symbol:
+            point = 0.1
+        elif "BTC" in ticker_symbol:
+            point = 1.0
+        else:
+            point = 0.0001
         
         trades = []
         in_position = False
@@ -217,7 +222,7 @@ def run_strategy_backtest(ticker_symbol: str, timeframe: str, lookback_days: int
             high_val = df["High"].iloc[i]
             low_val = df["Low"].iloc[i]
             
-            # Extract scalar cleanly whether iloc returns a Series or scalar
+            # Safely extract scalar value whether returned as Series or float
             high = float(high_val.iloc[0]) if isinstance(high_val, pd.Series) else float(high_val)
             low = float(low_val.iloc[0]) if isinstance(low_val, pd.Series) else float(low_val)
             
@@ -312,8 +317,15 @@ def evaluate_trade_status(saved_signal: dict, current_price: float) -> dict:
     if entry == 0.0 or sl == 0.0:
         return {"recommendation": "UNKNOWN", "analysis": "Invalid levels."}
 
-    is_gold = "GC=F" in saved_signal.get("ticker", "") or "Gold" in saved_signal.get("asset", "")
-    point = 0.1 if is_gold else 0.0001
+    ticker_str = saved_signal.get("ticker", "")
+    asset_str = saved_signal.get("asset", "")
+    
+    if "GC=F" in ticker_str or "Gold" in asset_str:
+        point = 0.1
+    elif "BTC" in ticker_str or "Bitcoin" in asset_str:
+        point = 1.0
+    else:
+        point = 0.0001
 
     if "BUY" in action:
         pnl_pips = (current_price - entry) / point
